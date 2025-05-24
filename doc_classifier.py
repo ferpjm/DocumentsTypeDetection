@@ -2,128 +2,216 @@ import cv2
 import numpy as np
 from sklearn.svm import SVC
 from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.decomposition import PCA
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.preprocessing import StandardScaler
 import os
 import sys
 
-def load_images(directory, size=(400, 300)):
-    """Load and preprocess images from the specified directory."""
-    images = []
-    labels = []
-    class_map = {
-        'Comics': 0, 'Libros': 1, 'Manuscrito': 2,
-        'Mecanografiado': 3, 'Tickets': 4
-    }
-    valid_extensions = ('.jpg', '.jpeg', '.png')
+# Identity scaler for precomputed features
+class IdentityScaler:
+    def transform(self, X):
+        return X
 
-    for class_name in class_map:
-        class_dir = os.path.join(directory, class_name)
-        if not os.path.exists(class_dir):
-            print(f"Directory not found: {class_dir}")
-            continue
-        for img_name in os.listdir(class_dir):
-            if not img_name.lower().endswith(valid_extensions):
-                continue
-            img_path = os.path.join(class_dir, img_name)
-            img = cv2.imread(img_path)
-            if img is not None:
-                img = cv2.resize(img, size, interpolation=cv2.INTER_LINEAR)
-                img_vector = (img.flatten().astype(np.float32) / 255.0)
-                images.append(img_vector)
-                labels.append(class_map[class_name])
-            else:
-                print(f"Failed to load image: {img_path}")
+# Rectification functions
 
-    print(f"Loaded {len(images)} images with {len(labels)} labels from {directory}")
-    images_array = np.array(images)
-    if images_array.ndim == 1:
-        images_array = images_array.reshape(1, -1)
-    return images_array, np.array(labels, dtype=np.int32)
+def order_points(pts):
+    s = pts.sum(axis=1)
+    diff = np.diff(pts, axis=1)
+    return np.array([pts[np.argmin(s)], pts[np.argmin(diff)], pts[np.argmax(s)], pts[np.argmax(diff)]], dtype=np.float32)
 
-def build_classifier_c1(images, labels):
-    """Build the C1 classifier using SVM."""
-    clf = SVC(kernel='linear', random_state=42)
-    clf.fit(images, labels)
-    return clf
 
-def build_classifier_c2(images, labels, n_components=4, kernel='rbf', C=100.0):
-    """Build the C2 classifier using LDA + SVM."""
+def rectify_document(img, dst_size=(400,300)):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5,5), 0)
+    edged = cv2.Canny(blurred, 75, 200)
+    contours, _ = cv2.findContours(edged, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+    for cnt in contours:
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+        if len(approx) == 4:
+            pts = approx.reshape(4,2).astype(np.float32)
+            rect = order_points(pts)
+            w, h = dst_size
+            dst = np.array([[0,0],[w-1,0],[w-1,h-1],[0,h-1]], dtype=np.float32)
+            M = cv2.getPerspectiveTransform(rect, dst)
+            warped = cv2.warpPerspective(img, M, (w, h))
+            return warped
+    return cv2.resize(img, dst_size, interpolation=cv2.INTER_LINEAR)
+
+# HOG extraction with OpenCV
+
+def extract_hog_opencv(gray, win_size=(400,300)):
+    cell_size = (20,20)
+    block_size = (cell_size[0]*2, cell_size[1]*2)
+    block_stride = cell_size
+    nbins = 9
+    hog = cv2.HOGDescriptor(
+        _winSize=win_size,
+        _blockSize=block_size,
+        _blockStride=block_stride,
+        _cellSize=cell_size,
+        _nbins=nbins
+    )
+    return hog.compute(gray).flatten()
+
+# Data loading
+
+def load_images(directory, size=(400,300), rectify=False, use_hog=False):
+    images, labels = [], []
+    class_map = {'Comics':0, 'Libros':1, 'Manuscrito':2, 'Mecanografiado':3, 'Tickets':4}
+    for cls, lbl in class_map.items():
+        path = os.path.join(directory, cls)
+        if not os.path.isdir(path): continue
+        for fname in os.listdir(path):
+            if not fname.lower().endswith(('.jpg','.jpeg','.png')): continue
+            img = cv2.imread(os.path.join(path, fname))
+            if img is None: continue
+            img_proc = rectify_document(img, size) if rectify else cv2.resize(img, size, interpolation=cv2.INTER_LINEAR)
+            gray = cv2.cvtColor(img_proc, cv2.COLOR_BGR2GRAY)
+            vec = extract_hog_opencv(gray, win_size=size) if use_hog else gray.flatten().astype(np.float32)/255.0
+            images.append(vec)
+            labels.append(lbl)
+    X = np.array(images)
+    y = np.array(labels, dtype=np.int32)
+    mode = ('rectified ' if rectify else '') + ('HOG ' if use_hog else '')
+    print(f"Loaded {len(X)} {mode}images from {directory}")
+    return X, y
+
+# Classifier builders
+
+def build_classifier_c1(X, y, kernel='linear', C=1.0):
     scaler = StandardScaler()
-    images_scaled = scaler.fit_transform(images)
-    lda = LinearDiscriminantAnalysis(n_components=n_components)
-    reduced_images = lda.fit_transform(images_scaled, labels)
-    print(f"Reduced features shape: {reduced_images.shape}")
-    print(f"Feature variance: {np.var(reduced_images, axis=0)}")
+    Xs = scaler.fit_transform(X)
     clf = SVC(kernel=kernel, C=C, class_weight='balanced', random_state=42)
-    clf.fit(reduced_images, labels)
-    return clf, lda, scaler
+    clf.fit(Xs, y)
+    return clf, scaler
 
-def evaluate_classifier(classifier, test_images, test_labels):
-    """Evaluate the classifier and return metrics."""
-    predictions = classifier.predict(test_images)
-    accuracy = np.mean(predictions == test_labels)
-    report = classification_report(test_labels, predictions,
-                                  target_names=['Comics', 'Libros', 'Manuscrito', 'Mecanografiado', 'Tickets'],
-                                  output_dict=True)
-    conf_matrix = confusion_matrix(test_labels, predictions)
+
+def build_classifier_c2(X, y, n_pca=50, n_lda=4, kernel='rbf', C=1.0, gamma='scale'):
+    scaler1 = StandardScaler()
+    Xs = scaler1.fit_transform(X)
+    pca = PCA(n_components=n_pca, whiten=True, random_state=42)
+    Xp = pca.fit_transform(Xs)
+    lda = LinearDiscriminantAnalysis(n_components=n_lda)
+    Xl = lda.fit_transform(Xp, y)
+    scaler2 = StandardScaler()
+    Xf = scaler2.fit_transform(Xl)
+    clf = SVC(kernel=kernel, C=C, gamma=gamma, class_weight='balanced', random_state=42)
+    clf.fit(Xf, y)
+    return clf, scaler1, pca, lda, scaler2
+
+
+def build_classifier_c3(X, y,
+                        n_pca=50, n_lda=4,
+                        kernel='linear', C=1.0, gamma='scale'):
+    """
+    Build C3: HOG features on rectified images, then PCA->LDA->SVM pipeline
+    """
+    # Scale HOG features
+    scaler1 = StandardScaler()
+    Xs = scaler1.fit_transform(X)
+    # PCA reduction
+    pca = PCA(n_components=n_pca, whiten=True, random_state=42)
+    Xp = pca.fit_transform(Xs)
+    print(f"C3 PCA output shape: {Xp.shape}")
+    # LDA reduction
+    lda = LinearDiscriminantAnalysis(n_components=n_lda)
+    Xl = lda.fit_transform(Xp, y)
+    print(f"C3 LDA output shape: {Xl.shape}")
+    # Final scale
+    scaler2 = StandardScaler()
+    Xf = scaler2.fit_transform(Xl)
+    # SVM on reduced features
+    clf = SVC(kernel=kernel, C=C, gamma=gamma, class_weight='balanced', random_state=42)
+    clf.fit(Xf, y)
+    return clf, scaler1, pca, lda, scaler2
+
+# Evaluation utility
+
+def evaluate(clf, scaler, X, y, names):
+    Xs = scaler.transform(X)
+    preds = clf.predict(Xs)
+    acc = np.mean(preds == y)
     print("\nConfusion Matrix:")
-    print(conf_matrix)
-    return accuracy, report
+    print(confusion_matrix(y, preds))
+    print(classification_report(y, preds, target_names=names))
+    print(f"Accuracy: {acc:.2f}\n")
+    return acc
 
-if __name__ == "__main__":
+# Main
+
+if __name__ == '__main__':
     if len(sys.argv) != 2:
-        print("Usage: python doc_classifier.py imagen.jpg")
+        print("Usage: python doc_classifier.py <image>")
         sys.exit(1)
 
-    train_images, train_labels = load_images('MUESTRA\\Aprendizaje')
-    if len(train_images) != 125:
-        print(f"Error: Expected 125 training images, but loaded {len(train_images)}. Check directory structure.")
-        sys.exit(1)
-    class_map = {0: 'Comics', 1: 'Libros', 2: 'Manuscrito', 3: 'Mecanografiado', 4: 'Tickets'}
-    label_counts = np.bincount(train_labels)
-    print("Training label distribution:")
-    for i, count in enumerate(label_counts):
-        print(f"{class_map[i]}: {count}")
+    names = ['Comics', 'Libros', 'Manuscrito', 'Mecanografiado', 'Tickets']
 
-    clf_c1 = build_classifier_c1(train_images, train_labels)
-    clf_c2, lda_c2, scaler_c2 = build_classifier_c2(train_images, train_labels, n_components=4, kernel='rbf', C=100.0)
+    # Load training data
+    X_train, y_train = load_images('MUESTRA/Aprendizaje')
+    # Build classifiers
+    clf1, sc1 = build_classifier_c1(X_train, y_train)
+    clf2, sc2_1, pca, lda, sc2_2 = build_classifier_c2(X_train, y_train)
+    Xr_train, yr_train = load_images('MUESTRA/Aprendizaje', rectify=True, use_hog=True)
+    clf3, c3_s1, c3_pca, c3_lda, c3_s2 = build_classifier_c3(Xr_train, yr_train)
 
-    test_images, test_labels = load_images('MUESTRA\\Test')
-    if len(test_images) != 40:
-        print(f"Error: Expected 40 test images, but loaded {len(test_images)}. Check directory structure.")
-        sys.exit(1)
+    # Load test data
+    X_test, y_test = load_images('MUESTRA/Test')
+    Xr_test, yr_test = load_images('MUESTRA/Test', rectify=True, use_hog=True)
 
     # Evaluate C1
-    accuracy_c1, report_c1 = evaluate_classifier(clf_c1, test_images, test_labels)
-    print(f"C1 Test Accuracy: {accuracy_c1:.2f}")
-    print("\nC1 Classification Report:")
-    for label, metrics in report_c1.items():
-        if label in ['Comics', 'Libros', 'Manuscrito', 'Mecanografiado', 'Tickets']:
-            print(f"{label}: Precision={metrics['precision']:.2f}, Recall={metrics['recall']:.2f}, F1-Score={metrics['f1-score']:.2f}")
+    print('=== C1 Results ===')
+    evaluate(clf1, sc1, X_test, y_test, names)
 
     # Evaluate C2
-    test_images_scaled = scaler_c2.transform(test_images)
-    test_images_reduced = lda_c2.transform(test_images_scaled)
-    accuracy_c2, report_c2 = evaluate_classifier(clf_c2, test_images_reduced, test_labels)
-    print(f"\nC2 Test Accuracy: {accuracy_c2:.2f}")
-    print("\nC2 Classification Report:")
-    for label, metrics in report_c2.items():
-        if label in ['Comics', 'Libros', 'Manuscrito', 'Mecanografiado', 'Tickets']:
-            print(f"{label}: Precision={metrics['precision']:.2f}, Recall={metrics['recall']:.2f}, F1-Score={metrics['f1-score']:.2f}")
+    Xt = sc2_1.transform(X_test)
+    Xt = pca.transform(Xt)
+    Xt = lda.transform(Xt)
+    Xt = sc2_2.transform(Xt)
+    print('=== C2 Results ===')
+    evaluate(clf2, IdentityScaler(), Xt, y_test, names)
 
-    # Classify a single image with both classifiers
-    img_path = sys.argv[1]
-    img = cv2.imread(img_path)
-    if img is not None:
-        img = cv2.resize(img, (400, 300), interpolation=cv2.INTER_LINEAR)
-        img_vector = (img.flatten().astype(np.float32) / 255.0).reshape(1, -1)
-        prediction_c1 = clf_c1.predict(img_vector)
-        img_vector_scaled = scaler_c2.transform(img_vector)
-        img_vector_reduced = lda_c2.transform(img_vector_scaled)
-        prediction_c2 = clf_c2.predict(img_vector_reduced)
-        class_map = {0: 'Comics', 1: 'Libros', 2: 'Manuscrito', 3: 'Mecanografiado', 4: 'Tickets'}
-        print(f"\nC1 Predicted class for {img_path}: {class_map[prediction_c1[0]]}")
-        print(f"C2 Predicted class for {img_path}: {class_map[prediction_c2[0]]}")
-    else:
-        print(f"Error: Could not load image {img_path}")
+        # Evaluate C3 with PCA+LDA on HOG
+    clf3, c3_s1, c3_pca, c3_lda, c3_s2 = build_classifier_c3(Xr_train, yr_train)
+    # Prepare C3 test features
+    Xc = c3_s1.transform(Xr_test)
+    Xc = c3_pca.transform(Xc)
+    Xc = c3_lda.transform(Xc)
+    Xc = c3_s2.transform(Xc)
+    print('=== C3 Results (HOG + PCA+LDA) ===')
+    evaluate(clf3, IdentityScaler(), Xc, yr_test, names)
+
+        # Classify single image using all three pipelines
+    img = cv2.imread(sys.argv[1])
+    if img is None:
+        print(f"Error loading image {sys.argv[1]}")
+        sys.exit(1)
+
+        # Preprocess vector for C1 & C2
+    img_resized = cv2.resize(img, (400,300), interpolation=cv2.INTER_LINEAR)
+    gray_single = cv2.cvtColor(img_resized, cv2.COLOR_BGR2GRAY)
+    vec = gray_single.flatten().astype(np.float32) / 255.0
+    # C1 prediction
+    p1 = clf1.predict(sc1.transform(vec.reshape(1,-1)))[0]
+    # C2 prediction
+    v2 = sc2_1.transform(vec.reshape(1,-1))
+    v2 = pca.transform(v2)
+    v2 = lda.transform(v2)
+    v2 = sc2_2.transform(v2)
+    p2 = clf2.predict(v2)[0]
+
+    # C3 prediction
+    rec = rectify_document(img)
+    gray = cv2.cvtColor(rec, cv2.COLOR_BGR2GRAY)
+    hog_vec = extract_hog_opencv(gray, win_size=(400,300)).reshape(1, -1)
+    v3 = c3_s1.transform(hog_vec)
+    v3 = c3_pca.transform(v3)
+    v3 = c3_lda.transform(v3)
+    v3 = c3_s2.transform(v3)
+    p3 = clf3.predict(v3)[0]
+
+    print(f"C1 prediction: {names[p1]}")
+    print(f"C2 prediction: {names[p2]}")
+    print(f"C3 prediction: {names[p3]}")
