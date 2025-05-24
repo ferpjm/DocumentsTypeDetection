@@ -1,0 +1,8 @@
+1. Install Python 3.11.
+2. Create virtual environment:
+   python -m venv venv
+   .\venv\Scripts\activate
+3. Install dependencies:
+   python -m pip install -r requirements.txt
+4. Run:
+   python doc_classifier.py test\Libros\Libro_1.jpg
