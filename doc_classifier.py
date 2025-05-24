@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+from sklearn.model_selection import GridSearchCV
 from sklearn.svm import SVC
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.decomposition import PCA
@@ -43,10 +44,10 @@ def rectify_document(img, dst_size=(400,300)):
 # HOG extraction with OpenCV
 
 def extract_hog_opencv(gray, win_size=(400,300)):
-    cell_size = (20,20)
+    cell_size = (10,10)
     block_size = (cell_size[0]*2, cell_size[1]*2)
     block_stride = cell_size
-    nbins = 9
+    nbins = 12
     hog = cv2.HOGDescriptor(
         _winSize=win_size,
         _blockSize=block_size,
@@ -102,31 +103,36 @@ def build_classifier_c2(X, y, n_pca=50, n_lda=4, kernel='rbf', C=1.0, gamma='sca
     clf.fit(Xf, y)
     return clf, scaler1, pca, lda, scaler2
 
-
-def build_classifier_c3(X, y,
-                        n_pca=50, n_lda=4,
-                        kernel='linear', C=1.0, gamma='scale'):
-    """
-    Build C3: HOG features on rectified images, then PCA->LDA->SVM pipeline
-    """
-    # Scale HOG features
+def build_classifier_c3(X, y, n_pca=75, n_lda=4):
     scaler1 = StandardScaler()
     Xs = scaler1.fit_transform(X)
-    # PCA reduction
+    if np.any(np.isnan(Xs)) or np.any(np.isinf(Xs)):
+        print("Datos con NaN o inf después de StandardScaler")
     pca = PCA(n_components=n_pca, whiten=True, random_state=42)
     Xp = pca.fit_transform(Xs)
     print(f"C3 PCA output shape: {Xp.shape}")
-    # LDA reduction
+    if np.any(np.isnan(Xp)) or np.any(np.isinf(Xp)):
+        print("Datos con NaN o inf después de PCA")
     lda = LinearDiscriminantAnalysis(n_components=n_lda)
     Xl = lda.fit_transform(Xp, y)
     print(f"C3 LDA output shape: {Xl.shape}")
-    # Final scale
+    if np.any(np.isnan(Xl)) or np.any(np.isinf(Xl)):
+        print("Datos con NaN o inf después de LDA")
     scaler2 = StandardScaler()
     Xf = scaler2.fit_transform(Xl)
-    # SVM on reduced features
-    clf = SVC(kernel=kernel, C=C, gamma=gamma, class_weight='balanced', random_state=42)
-    clf.fit(Xf, y)
-    return clf, scaler1, pca, lda, scaler2
+    if np.any(np.isnan(Xf)) or np.any(np.isinf(Xf)):
+        print("Datos con NaN o inf después del segundo StandardScaler")
+
+    param_grid = {'C': [1, 10], 'kernel': ['rbf'], 'gamma': ['scale']}
+    clf = GridSearchCV(SVC(class_weight='balanced', random_state=42), param_grid, cv=5, verbose=2)
+    try:
+        print(f"Entrenando GridSearchCV con datos de forma: {Xf.shape}")
+        clf.fit(Xf, y)
+        print(f"Mejores parámetros: {clf.best_params_}")
+    except Exception as e:
+        print(f"Error en GridSearchCV: {e}")
+        raise
+    return clf.best_estimator_, scaler1, pca, lda, scaler2
 
 # Evaluation utility
 
@@ -156,7 +162,6 @@ if __name__ == '__main__':
     clf2, sc2_1, pca, lda, sc2_2 = build_classifier_c2(X_train, y_train)
     Xr_train, yr_train = load_images('MUESTRA/Aprendizaje', rectify=True, use_hog=True)
     clf3, c3_s1, c3_pca, c3_lda, c3_s2 = build_classifier_c3(Xr_train, yr_train)
-
     # Load test data
     X_test, y_test = load_images('MUESTRA/Test')
     Xr_test, yr_test = load_images('MUESTRA/Test', rectify=True, use_hog=True)
